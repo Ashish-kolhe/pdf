@@ -360,7 +360,7 @@ export default function ImageToPdfConverter() {
 
             // Add footer text
             const font = await pdfDoc.embedFont(StandardFonts.Helvetica)
-            page.drawText("Made by Ashish", {
+            page.drawText(" ", {
               x: 20,
               y: 20,
               size: 12,
