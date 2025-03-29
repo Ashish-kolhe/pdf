@@ -2,80 +2,244 @@
 
 import type React from "react"
 
-import { useState, useRef } from "react"
+import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Camera, Upload, FileText, Trash2, Download } from "lucide-react"
+import { Camera, Upload, FileText, Trash2, Download, Loader2 } from "lucide-react"
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib"
 import FileSaver from "file-saver"
+import { toast } from "@/components/ui/use-toast"
+import { Alert, AlertDescription } from "@/components/ui/alert"
 
 export default function ImageToPdfConverter() {
   const [images, setImages] = useState<string[]>([])
   const [activeTab, setActiveTab] = useState("camera")
   const [cameraActive, setCameraActive] = useState(false)
   const [pdfUrl, setPdfUrl] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState({
+    camera: false,
+    capture: false,
+    pdf: false,
+  })
+  const [error, setError] = useState<string | null>(null)
+
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
 
-  // Start camera stream
+  // Cleanup function for camera stream
+  const cleanupCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop())
+      streamRef.current = null
+    }
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+
+    setCameraActive(false)
+    setIsLoading((prev) => ({ ...prev, camera: false }))
+  }
+
+  // Cleanup on component unmount
+  useEffect(() => {
+    return () => {
+      cleanupCamera()
+
+      // Revoke any object URLs to prevent memory leaks
+      if (pdfUrl) {
+        URL.revokeObjectURL(pdfUrl)
+      }
+    }
+  }, [pdfUrl])
+
+  // Start camera stream with better error handling
   const startCamera = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" },
-      })
+    setError(null)
+    setIsLoading((prev) => ({ ...prev, camera: true }))
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        setCameraActive(true)
+    try {
+      // First try to get the environment-facing camera (back camera on mobile)
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+        })
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
+          streamRef.current = stream
+          setCameraActive(true)
+        }
+      } catch (envError) {
+        // If that fails, try with any available camera
+        console.warn("Could not access environment camera, trying default:", envError)
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+        })
+
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
+          streamRef.current = stream
+          setCameraActive(true)
+        }
       }
     } catch (err) {
       console.error("Error accessing camera:", err)
-      alert("Could not access camera. Please check permissions.")
+      setError("Could not access camera. Please check permissions or try the gallery option.")
+      toast({
+        title: "Camera Error",
+        description: "Could not access camera. Please check permissions.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsLoading((prev) => ({ ...prev, camera: false }))
     }
   }
 
-  // Stop camera stream
+  // Stop camera stream with improved cleanup
   const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const tracks = (videoRef.current.srcObject as MediaStream).getTracks()
-      tracks.forEach((track) => track.stop())
-      videoRef.current.srcObject = null
-      setCameraActive(false)
-    }
+    cleanupCamera()
   }
 
-  // Capture image from camera
+  // Capture image from camera with better error handling and loading state
   const captureImage = () => {
-    if (videoRef.current && canvasRef.current) {
-      const canvas = canvasRef.current
-      const video = videoRef.current
+    setIsLoading((prev) => ({ ...prev, capture: true }))
 
-      canvas.width = video.videoWidth
-      canvas.height = video.videoHeight
+    try {
+      if (videoRef.current && canvasRef.current) {
+        const canvas = canvasRef.current
+        const video = videoRef.current
 
-      const ctx = canvas.getContext("2d")
-      if (ctx) {
+        // Ensure video is playing and has dimensions
+        if (video.videoWidth === 0 || video.videoHeight === 0) {
+          throw new Error("Video stream not ready yet")
+        }
+
+        canvas.width = video.videoWidth
+        canvas.height = video.videoHeight
+
+        const ctx = canvas.getContext("2d")
+        if (!ctx) {
+          throw new Error("Could not get canvas context")
+        }
+
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
-        const imageData = canvas.toDataURL("image/jpeg")
+
+        // Optimize image quality/size - always use PNG for better compatibility
+        const imageData = canvas.toDataURL("image/png", 0.85)
         setImages((prev) => [...prev, imageData])
+
+        toast({
+          title: "Image Captured",
+          description: `Image ${images.length + 1} added to your collection.`,
+        })
       }
+    } catch (err) {
+      console.error("Error capturing image:", err)
+      toast({
+        title: "Capture Failed",
+        description: "Failed to capture image. Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsLoading((prev) => ({ ...prev, capture: false }))
     }
   }
 
-  // Handle file selection from gallery
+  // Handle file selection with better error handling
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files
-    if (!files) return
+    if (!files || files.length === 0) return
 
-    Array.from(files).forEach((file) => {
+    setError(null)
+
+    // Limit number of files to prevent performance issues
+    const maxFiles = 10
+    const filesToProcess = Array.from(files).slice(0, maxFiles)
+
+    if (files.length > maxFiles) {
+      toast({
+        title: "Too many files",
+        description: `Only the first ${maxFiles} images will be processed to ensure performance.`,
+      })
+    }
+
+    let loadedCount = 0
+    const totalFiles = filesToProcess.length
+
+    filesToProcess.forEach((file) => {
+      // Check file size (limit to 5MB per file)
+      if (file.size > 5 * 1024 * 1024) {
+        toast({
+          title: "File too large",
+          description: `${file.name} exceeds 5MB and will be skipped.`,
+          variant: "destructive",
+        })
+        loadedCount++
+        return
+      }
+
       const reader = new FileReader()
+
       reader.onload = (e) => {
         if (e.target && typeof e.target.result === "string") {
-          setImages((prev) => [...prev, e.target.result])
+          // Resize large images to improve performance
+          const img = new Image()
+          img.onload = () => {
+            const canvas = document.createElement("canvas")
+            const MAX_WIDTH = 1800
+            const MAX_HEIGHT = 1800
+            let width = img.width
+            let height = img.height
+
+            // Resize if image is too large
+            if (width > MAX_WIDTH || height > MAX_HEIGHT) {
+              if (width > height) {
+                height = Math.round(height * (MAX_WIDTH / width))
+                width = MAX_WIDTH
+              } else {
+                width = Math.round(width * (MAX_HEIGHT / height))
+                height = MAX_HEIGHT
+              }
+            }
+
+            canvas.width = width
+            canvas.height = height
+
+            const ctx = canvas.getContext("2d")
+            if (ctx) {
+              ctx.drawImage(img, 0, 0, width, height)
+              // Always convert to PNG for better compatibility with pdf-lib
+              const optimizedImage = canvas.toDataURL("image/png", 0.85)
+              setImages((prev) => [...prev, optimizedImage])
+            }
+
+            loadedCount++
+            if (loadedCount === totalFiles) {
+              toast({
+                title: "Images Loaded",
+                description: `${loadedCount} images added successfully.`,
+              })
+            }
+          }
+
+          img.src = e.target.result
         }
       }
+
+      reader.onerror = () => {
+        console.error(`Error reading file: ${file.name}`)
+        loadedCount++
+        toast({
+          title: "File Error",
+          description: `Could not read ${file.name}.`,
+          variant: "destructive",
+        })
+      }
+
       reader.readAsDataURL(file)
     })
 
@@ -88,52 +252,129 @@ export default function ImageToPdfConverter() {
   // Remove image from list
   const removeImage = (index: number) => {
     setImages((prev) => prev.filter((_, i) => i !== index))
+    toast({
+      title: "Image Removed",
+      description: "Image removed from collection.",
+    })
   }
 
-  // Generate PDF from images
+  // Generate PDF with improved error handling and performance
   const generatePDF = async () => {
     if (images.length === 0) {
-      alert("Please add at least one image")
+      toast({
+        title: "No Images",
+        description: "Please add at least one image before generating a PDF.",
+        variant: "destructive",
+      })
       return
+    }
+
+    setIsLoading((prev) => ({ ...prev, pdf: true }))
+    setError(null)
+
+    // Revoke previous PDF URL to prevent memory leaks
+    if (pdfUrl) {
+      URL.revokeObjectURL(pdfUrl)
+      setPdfUrl(null)
     }
 
     try {
       // Create a new PDF document
       const pdfDoc = await PDFDocument.create()
 
-      // Add each image as a page
-      for (const imageData of images) {
-        // Remove data URL prefix to get base64 data
-        const base64Data = imageData.replace(/^data:image\/(png|jpeg|jpg);base64,/, "")
+      // Process images in batches to prevent UI freezing
+      const batchSize = 3
+      const totalBatches = Math.ceil(images.length / batchSize)
 
-        // Determine image type and embed it
-        let imageBytes
-        if (imageData.includes("data:image/png")) {
-          imageBytes = await pdfDoc.embedPng(base64Data)
-        } else {
-          imageBytes = await pdfDoc.embedJpeg(base64Data)
+      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+        const batchStart = batchIndex * batchSize
+        const batchEnd = Math.min((batchIndex + 1) * batchSize, images.length)
+        const batch = images.slice(batchStart, batchEnd)
+
+        // Process each image in the current batch
+        for (const imageData of batch) {
+          try {
+            // Create a temporary image to get dimensions
+            const img = document.createElement("img")
+            img.src = imageData
+
+            // Wait for image to load to get dimensions
+            await new Promise((resolve) => {
+              img.onload = resolve
+            })
+
+            // Create a canvas to draw the image
+            const canvas = document.createElement("canvas")
+            canvas.width = img.width
+            canvas.height = img.height
+
+            const ctx = canvas.getContext("2d")
+            if (!ctx) continue
+
+            // Draw the image on the canvas
+            ctx.drawImage(img, 0, 0)
+
+            // Get the image data as PNG (always use PNG for pdf-lib compatibility)
+            const pngDataUrl = canvas.toDataURL("image/png")
+
+            // Extract the base64 data
+            const base64Data = pngDataUrl.split(",")[1]
+
+            // Convert base64 to binary data
+            const binaryData = atob(base64Data)
+            const bytes = new Uint8Array(binaryData.length)
+            for (let i = 0; i < binaryData.length; i++) {
+              bytes[i] = binaryData.charCodeAt(i)
+            }
+
+            // Embed the PNG image
+            const embeddedImage = await pdfDoc.embedPng(bytes)
+
+            // Calculate dimensions while maintaining aspect ratio
+            const MAX_WIDTH = 792 - 40 // US Letter width - margins
+            const MAX_HEIGHT = 612 - 60 // US Letter height - margins
+
+            let width = embeddedImage.width
+            let height = embeddedImage.height
+
+            if (width > MAX_WIDTH) {
+              height = (height * MAX_WIDTH) / width
+              width = MAX_WIDTH
+            }
+
+            if (height > MAX_HEIGHT) {
+              width = (width * MAX_HEIGHT) / height
+              height = MAX_HEIGHT
+            }
+
+            // Add a new page with appropriate dimensions
+            const page = pdfDoc.addPage([width + 40, height + 60])
+
+            // Draw the image
+            page.drawImage(embeddedImage, {
+              x: 20,
+              y: 40,
+              width,
+              height,
+            })
+
+            // Add footer text
+            const font = await pdfDoc.embedFont(StandardFonts.Helvetica)
+            page.drawText("Made by Ashish", {
+              x: 20,
+              y: 20,
+              size: 12,
+              font,
+              color: rgb(0.3, 0.3, 0.3),
+            })
+          } catch (imageError) {
+            console.error("Error processing image for PDF:", imageError)
+            // Continue with other images
+          }
         }
 
-        // Add a new page with image dimensions
-        const page = pdfDoc.addPage([imageBytes.width + 40, imageBytes.height + 60])
-
-        // Draw the image
-        page.drawImage(imageBytes, {
-          x: 20,
-          y: 40,
-          width: imageBytes.width,
-          height: imageBytes.height,
-        })
-
-        // Add footer text
-        const font = await pdfDoc.embedFont(StandardFonts.Helvetica)
-        page.drawText("Made by Ashish", {
-          x: 20,
-          y: 20,
-          size: 12,
-          font,
-          color: rgb(0.3, 0.3, 0.3),
-        })
+        // Allow UI to update between batches
+        await new Promise((resolve) => setTimeout(resolve, 0))
       }
 
       // Save the PDF
@@ -144,9 +385,20 @@ export default function ImageToPdfConverter() {
       const url = URL.createObjectURL(blob)
 
       setPdfUrl(url)
+      toast({
+        title: "PDF Generated",
+        description: "Your PDF has been created successfully.",
+      })
     } catch (error) {
       console.error("Error generating PDF:", error)
-      alert("Failed to generate PDF. Please try again.")
+      setError("Failed to generate PDF. Please try again with fewer or smaller images.")
+      toast({
+        title: "PDF Generation Failed",
+        description: "Could not create PDF. Please try again with fewer images.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsLoading((prev) => ({ ...prev, pdf: false }))
     }
   }
 
@@ -154,6 +406,10 @@ export default function ImageToPdfConverter() {
   const downloadPDF = () => {
     if (pdfUrl) {
       FileSaver.saveAs(pdfUrl, "images-to-pdf.pdf")
+      toast({
+        title: "Download Started",
+        description: "Your PDF is being downloaded.",
+      })
     }
   }
 
@@ -163,15 +419,27 @@ export default function ImageToPdfConverter() {
     if (value !== "camera" && cameraActive) {
       stopCamera()
     }
+    setError(null)
   }
 
-  // Clean up on unmount
+  // Clean up and reset
   const resetAll = () => {
     if (cameraActive) {
       stopCamera()
     }
+
     setImages([])
-    setPdfUrl(null)
+
+    if (pdfUrl) {
+      URL.revokeObjectURL(pdfUrl)
+      setPdfUrl(null)
+    }
+
+    setError(null)
+    toast({
+      title: "Reset Complete",
+      description: "All images and PDF have been cleared.",
+    })
   }
 
   return (
@@ -182,6 +450,12 @@ export default function ImageToPdfConverter() {
           <CardDescription>Capture images from your camera or select from your gallery to create a PDF</CardDescription>
         </CardHeader>
         <CardContent>
+          {error && (
+            <Alert variant="destructive" className="mb-4">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+
           <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
             <TabsList className="grid w-full grid-cols-2 mb-6">
               <TabsTrigger value="camera" onClick={() => setActiveTab("camera")}>
@@ -207,15 +481,33 @@ export default function ImageToPdfConverter() {
 
               <div className="flex justify-center gap-4">
                 {!cameraActive ? (
-                  <Button onClick={startCamera}>
-                    <Camera className="mr-2 h-4 w-4" />
-                    Start Camera
+                  <Button onClick={startCamera} disabled={isLoading.camera}>
+                    {isLoading.camera ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Accessing Camera...
+                      </>
+                    ) : (
+                      <>
+                        <Camera className="mr-2 h-4 w-4" />
+                        Start Camera
+                      </>
+                    )}
                   </Button>
                 ) : (
                   <>
-                    <Button onClick={captureImage} variant="default">
-                      <Camera className="mr-2 h-4 w-4" />
-                      Capture
+                    <Button onClick={captureImage} variant="default" disabled={isLoading.capture}>
+                      {isLoading.capture ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Capturing...
+                        </>
+                      ) : (
+                        <>
+                          <Camera className="mr-2 h-4 w-4" />
+                          Capture
+                        </>
+                      )}
                     </Button>
                     <Button onClick={stopCamera} variant="outline">
                       Stop Camera
@@ -243,7 +535,7 @@ export default function ImageToPdfConverter() {
                       className="hidden"
                     />
                   </div>
-                  <p className="mt-2 text-sm text-muted-foreground">PNG, JPG or JPEG</p>
+                  <p className="mt-2 text-sm text-muted-foreground">PNG, JPG or JPEG (max 5MB per file)</p>
                 </div>
               </div>
             </TabsContent>
@@ -260,6 +552,7 @@ export default function ImageToPdfConverter() {
                       src={image || "/placeholder.svg"}
                       alt={`Selected image ${index + 1}`}
                       className="w-full h-32 object-cover rounded-md"
+                      loading="lazy" // Lazy load images for better performance
                     />
                     <Button
                       variant="destructive"
@@ -274,9 +567,18 @@ export default function ImageToPdfConverter() {
               </div>
 
               <div className="mt-6 flex justify-center">
-                <Button onClick={generatePDF} disabled={images.length === 0}>
-                  <FileText className="mr-2 h-4 w-4" />
-                  Generate PDF
+                <Button onClick={generatePDF} disabled={images.length === 0 || isLoading.pdf}>
+                  {isLoading.pdf ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Generating PDF...
+                    </>
+                  ) : (
+                    <>
+                      <FileText className="mr-2 h-4 w-4" />
+                      Generate PDF
+                    </>
+                  )}
                 </Button>
               </div>
             </div>
